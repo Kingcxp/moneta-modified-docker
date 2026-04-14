@@ -1,0 +1,24 @@
+FROM ubuntu:22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+
+RUN apt update && apt install -y --no-install-recommends \
+    sudo \
+    micro \
+    tree \
+    file \
+    curl \
+    wget \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY --chown=root:root moneta-modified/ /workspace/moneta
+COPY --chown=root:root entrypoint.sh /workspace/entrypoint.sh
+
+RUN chmod +x /workspace/moneta/scripts/*.sh
+RUN chmod +x /workspace/moneta/build.sh
+
+ENTRYPOINT [ "/workspace/entrypoint.sh" ]
