@@ -11,6 +11,7 @@ RUN apt update && apt install -y --no-install-recommends \
     curl \
     wget \
     vim \
+    expect \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
