@@ -8,6 +8,7 @@ moneta-modified/go/pkg/
 moneta-modified/guest/linux
 
 .env
+.env.bak.*
 .vscode
 .direnv/
 

@@ -17,7 +17,7 @@ RUN apt update && apt install -y --no-install-recommends \
 WORKDIR /workspace
 
 COPY --chown=root:root moneta-modified/ /workspace/moneta
-COPY --chown=root:root entrypoint.sh /workspace/entrypoint.sh
+COPY --chown=root:root scripts/entrypoint.sh /workspace/entrypoint.sh
 
 RUN chmod +x /workspace/moneta/scripts/*.sh
 RUN chmod +x /workspace/moneta/build.sh
