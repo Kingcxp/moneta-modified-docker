@@ -208,7 +208,8 @@ if [ -z "$IMAGE_NAME" ]; then
   if [ -f docker/Dockerfile ]; then
     IMAGE_NAME="moneta-nvidia"
     echo "[host] Building Docker image ${IMAGE_NAME} (may take a while)"
-    docker build -t ${IMAGE_NAME} -f docker/Dockerfile docker
+    # Use repository root as build context so Dockerfile can COPY files from project root
+    run_as_root "docker build -t ${IMAGE_NAME} -f $REPO_ROOT/docker/Dockerfile $REPO_ROOT"
   else
     echo "ERROR: no DOCKER_IMAGE provided and docker/Dockerfile not found" >&2
     exit 1
@@ -219,7 +220,7 @@ echo "[host] Starting container with privileged access and device passthrough"
 echo "  (container will mount this repo at /workspace)"
 
 # Run container in foreground; when it exits cleanup trap will run
-docker run --rm --privileged --name moneta-nvidia \
-  --env-file .env -e PCI_FULL=${PCI_FULL} \
-  ${IMAGE_NAME}
+run_as_root "docker run --rm --privileged --name moneta-nvidia \
+  --env-file $REPO_ROOT/.env -e PCI_FULL=${PCI_FULL} \
+  ${IMAGE_NAME}"
 
