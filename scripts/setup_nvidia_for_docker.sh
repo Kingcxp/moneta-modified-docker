@@ -29,8 +29,12 @@ If neither -i nor -p are provided the script will pick the first detected GPU.
 EOF
 }
 
+# 修复：检查.env.example是否存在，无则创建基础文件
 if [ ! -f "$ENV_EXAMPLE" ]; then
-  die ".env.example not found at $ENV_EXAMPLE"
+  echo "Warning: .env.example not found at $ENV_EXAMPLE, creating empty file" >&2
+  touch "$ENV_EXAMPLE"
+  echo "GPU_ID=" >> "$ENV_EXAMPLE"
+  echo "NVIDIA_VERSION=" >> "$ENV_EXAMPLE"
 fi
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -65,12 +69,8 @@ detect_with_nvidia_smi(){
     return 1
   fi
   for l in "${lines[@]}"; do
-    # split on first 3 commas: index,pci,name,uuid
     IFS=',' read -r idx pci rest <<< "$l"
-    # rest may contain additional commas; get last token as uuid
-    # try to extract uuid (it's usually the last comma-separated field)
     uuid="${l##*,}"
-    # name is whatever between second comma and last comma
     name_and_middle="${l#*,}"
     name_and_middle="${name_and_middle#*,}"
     name="${name_and_middle%,*}"
@@ -94,8 +94,6 @@ detect_with_lspci(){
   if ! command -v lspci >/dev/null 2>&1; then
     return 1
   fi
-  # Only consider display-class devices (VGA / 3D / Display) to avoid matching
-  # NVIDIA audio devices (e.g. the HDMI audio function at PCI .1).
   mapfile -t lines < <(lspci -D 2>/dev/null | grep -iE 'vga|3d controller|display controller' | grep -i nvidia || true)
   if [ "${#lines[@]}" -eq 0 ]; then
     return 1
@@ -168,10 +166,6 @@ echo
 echo "Selected GPU: index=$IDX pci=$PCI_SHORT name=$NAME"
 
 # Driver detection (best-effort)
-# Strategy:
-# 1) If nvidia-smi is present, read the installed driver full version (e.g. 530.41.43)
-# 2) If not installed, try distro tools to get a recommended/available nvidia-driver package
-#    (ubuntu-drivers / apt-cache / dnf). We select the highest numeric candidate but DO NOT install it.
 DRIVER_VER=""
 DRIVER_SOURCE=""
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -181,7 +175,6 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-# Try to get a distro recommended driver (package name like nvidia-driver-535)
 if [ -z "$DRIVER_VER" ] && command -v ubuntu-drivers >/dev/null 2>&1; then
   rec_pkg="$(ubuntu-drivers devices 2>/dev/null | grep recommended | head -n1 | grep -Po 'nvidia-driver-[0-9]+' || true)"
   if [ -n "$rec_pkg" ]; then
@@ -197,7 +190,6 @@ if [ -z "$DRIVER_VER" ] && command -v nvidia-detect >/dev/null 2>&1; then
   fi
 fi
 
-# Best-effort: find highest available nvidia-driver package from package manager (no install)
 find_latest_available_driver(){
   declare -a cand
   local tmp
@@ -214,7 +206,6 @@ find_latest_available_driver(){
     for x in "${tmp[@]}"; do cand+=("$x"); done
   fi
 
-  # dedupe
   if [ "${#cand[@]}" -eq 0 ]; then
     return 1
   fi
@@ -235,7 +226,6 @@ find_latest_available_driver(){
     printf '%s' "$best_pkg"
     return 0
   fi
-  # fallback: return first
   printf '%s' "${uniqs[0]}"
   return 0
 }
@@ -248,16 +238,17 @@ if [ -z "$DRIVER_VER" ]; then
     fi
   fi
 fi
-# Attempt to find a downloadable NVIDIA driver version on NVIDIA's servers
-# We want a version string such that the URL
-# https://download.nvidia.com/XFree86/Linux-x86_64/$VERSION/NVIDIA-Linux-x86_64-$VERSION.run
-# exists. Fetch the directory index and pick a matching/full version if possible.
+
+# 修复：增加curl依赖检查，避免无curl时脚本退出
 DOWNLOAD_VERSIONS_RAW=""
 DOWNLOAD_VERSIONS=()
 DOWNLOAD_SORTED=()
 if command -v curl >/dev/null 2>&1; then
   DOWNLOAD_VERSIONS_RAW="$(curl -fsSL --retry 2 --max-time 10 'https://download.nvidia.com/XFree86/Linux-x86_64/' 2>/dev/null || true)"
+else
+  echo "Warning: curl not found, skip downloadable version check" >&2
 fi
+
 if [ -n "$DOWNLOAD_VERSIONS_RAW" ]; then
   mapfile -t DOWNLOAD_VERSIONS < <(printf '%s\n' "$DOWNLOAD_VERSIONS_RAW" | grep -oE '([0-9]+\.[0-9]+(\.[0-9]+)*)/' | sed 's:/$::' | sort -V -u)
 fi
@@ -277,14 +268,9 @@ check_downloadable(){
 }
 
 if [ "${#DOWNLOAD_VERSIONS[@]}" -gt 0 ]; then
-  # sort descending
   mapfile -t DOWNLOAD_SORTED < <(printf '%s\n' "${DOWNLOAD_VERSIONS[@]}" | sort -V -r)
 
-  # If we have an exact installed/recommended DRIVER_VER that matches a downloadable
-  # version, prefer it. Otherwise, map package-like candidates (nvidia-driver-535)
-  # or major-only candidates to the highest matching full version.
   if [ -n "$DRIVER_VER" ]; then
-    # exact match
     for v in "${DOWNLOAD_SORTED[@]}"; do
       if [ "$v" = "$DRIVER_VER" ]; then
         DOWNLOAD_VER="$v"
@@ -292,16 +278,14 @@ if [ "${#DOWNLOAD_VERSIONS[@]}" -gt 0 ]; then
         break
       fi
     done
-    # try package-style or major mapping
     if [ -z "$DOWNLOAD_VER" ]; then
+      maj=""
       if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
         maj="${BASH_REMATCH[1]}"
       elif [[ "$DRIVER_VER" =~ ^([0-9]+)$ ]]; then
         maj="${BASH_REMATCH[1]}"
       elif [[ "$DRIVER_VER" =~ ^([0-9]+)\.[0-9]+ ]]; then
         maj="${BASH_REMATCH[1]}"
-      else
-        maj=""
       fi
       if [ -n "$maj" ]; then
         for v in "${DOWNLOAD_SORTED[@]}"; do
@@ -315,16 +299,19 @@ if [ "${#DOWNLOAD_VERSIONS[@]}" -gt 0 ]; then
     fi
   fi
 
-  # If still not found, pick latest available
+  # 修复：检查数组非空后再取值，避免set -u
   if [ -z "$DOWNLOAD_VER" ]; then
-    DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
-    DOWNLOAD_SOURCE="latest"
+    if [ ${#DOWNLOAD_SORTED[@]} -gt 0 ]; then
+      DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
+      DOWNLOAD_SOURCE="latest"
+    else
+      DOWNLOAD_VER=""
+      DOWNLOAD_SOURCE="none"
+    fi
   fi
 
-  # verify downloadable (should be, but double-check)
   if [ -n "$DOWNLOAD_VER" ]; then
     if ! check_downloadable "$DOWNLOAD_VER"; then
-      # if the chosen one is not downloadable for some reason, try to find any that is
       for v in "${DOWNLOAD_SORTED[@]}"; do
         if check_downloadable "$v"; then
           DOWNLOAD_VER="$v"
@@ -343,7 +330,6 @@ set_env(){
   key="$1"
   val="$2"
   file="$3"
-  # escape slashes and & for sed
   esc_val="$(printf '%s' "$val" | sed -e 's/[\/&]/\\&/g')"
   if grep -qE "^${key}=" "$file"; then
     sed -E "s/^(${key})=.*/\1=${esc_val}/" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
@@ -354,9 +340,8 @@ set_env(){
 
 set_env "GPU_ID" "$PCI_SHORT" "$ENV_FILE"
 set_env "PCI_FULL" "$PCI_FULL" "$ENV_FILE"
-# Ensure we write a concrete NVIDIA_VERSION (numeric like 530.41.03).
+
 ensure_concrete_version(){
-  # If the user forced a version via -v, accept it (must be numeric dotted form).
   if [ -n "${FORCE_VERSION:-}" ]; then
     if [[ "$FORCE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
       DOWNLOAD_VER="$FORCE_VERSION"
@@ -366,18 +351,15 @@ ensure_concrete_version(){
       die "Invalid format for -v: $FORCE_VERSION (expected numeric like 530.41.03)"
     fi
   fi
-  # If we already have a downloadable full version, use it.
   if [ -n "$DOWNLOAD_VER" ]; then
     return 0
   fi
-  # If driver string is already numeric/dotted, accept it.
   if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
     DOWNLOAD_VER="$DRIVER_VER"
     DOWNLOAD_SOURCE="driver-numeric"
     return 0
   fi
 
-  # Try to map package-like candidates (nvidia-driver-535) to a full downloadable version
   if [ "${#DOWNLOAD_SORTED[@]}" -gt 0 ] && [ -n "$DRIVER_VER" ]; then
     maj=""
     if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
@@ -398,12 +380,9 @@ ensure_concrete_version(){
     fi
   fi
 
-  # If still not found, either auto-pick latest in non-interactive/auto mode,
-  # or interactively prompt the user to choose.
   if [ -z "$DOWNLOAD_VER" ]; then
     if [ "${#DOWNLOAD_SORTED[@]}" -gt 0 ]; then
       if [ "$AUTO_PICK_LATEST" -eq 1 ] || [ ! -t 0 ]; then
-        # Non-interactive or auto-flag: choose the latest available
         DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
         DOWNLOAD_SOURCE="auto-latest"
       else
@@ -439,14 +418,10 @@ ensure_concrete_version(){
         fi
       fi
     else
-      # No downloadable list found; try to use numeric DRIVER_VER if present
       if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
         DOWNLOAD_VER="$DRIVER_VER"
         DOWNLOAD_SOURCE="driver-numeric"
       else
-        # If DRIVER_VER is a package-like name (nvidia-driver-580), try to extract
-        # a concrete numeric version from package metadata (apt-cache). If that
-        # fails, fall back to a best-effort major-version-derived string.
         if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
           maj="${BASH_REMATCH[1]}"
           if command -v apt-cache >/dev/null 2>&1; then
@@ -468,12 +443,10 @@ ensure_concrete_version(){
               fi
             fi
           fi
-          # Fallback: synthesize a version using the major (best-effort)
           DOWNLOAD_VER="${maj}.0.0"
           DOWNLOAD_SOURCE="fallback-major"
           echo "[setup_nvidia_for_docker] Warning: no upstream list found; using fallback NVIDIA_VERSION=${DOWNLOAD_VER} derived from ${DRIVER_VER}" >&2
         else
-          # Diagnostic output to help the user understand why automatic detection failed
           echo "[setup_nvidia_for_docker] Automatic version detection failed. Debug info:" >&2
           echo "  DRIVER_VER='${DRIVER_VER:-}'" >&2
           echo "  DOWNLOAD_VERSIONS_RAW length: $(printf '%s' "${DOWNLOAD_VERSIONS_RAW:-}" | wc -c)" >&2
@@ -490,7 +463,7 @@ ensure_concrete_version(){
 
 ensure_concrete_version
 
-set_env "NVIDIA_VERSION" "$DOWNLOAD_VER" "$ENV_FILE"
+set_env "NVIDIA_VERSION" "${DOWNLOAD_VER:-}" "$ENV_FILE"
 
 echo
 if [ -n "$DOWNLOAD_VER" ]; then
