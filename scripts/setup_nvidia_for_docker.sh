@@ -1,47 +1,99 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
+# ================= 核心设置（修改版） =================
+# 保留 pipefail，但不使用 set -e，我们手动处理错误
+set -uo pipefail
+shopt -s nullglob  # 处理空数组
+
+# ================= 全局变量 =================
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 ENV_FILE="$REPO_ROOT/.env"
 TS=$(date +%s)
+DEBUG=1  # 开启调试日志
 
-die(){
-  echo "ERROR: $*" >&2
-  exit 1
+# ================= 日志函数 =================
+log_info() { echo -e "\033[0;32m[INFO]\033[0m $*" >&2; }
+log_warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
+log_error() { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; }
+log_debug() { [ "$DEBUG" -eq 1 ] && echo -e "\033[0;34m[DEBUG]\033[0m $*" >&2; }
+
+# ================= 安全的命令执行函数 =================
+# 替代直接执行命令，捕获错误但不退出
+run_safe() {
+    log_debug "Executing: $*"
+    set +e
+    "$@"
+    local ret=$?
+    set -e
+    if [ $ret -ne 0 ]; then
+        log_warn "Command failed (ret=$ret): $*"
+    fi
+    return $ret
 }
 
+# ================= 带重试的 curl =================
+curl_retry() {
+    local max_attempts=3
+    local attempt=1
+    local url="$1"
+    shift
+
+    while [ $attempt -le $max_attempts ]; do
+        log_debug "curl attempt $attempt/$max_attempts: $url"
+        set +e
+        result=$(curl -fsSL --retry 2 --max-time 15 --connect-timeout 5 "$url" "$@" 2>&1)
+        local ret=$?
+        set -e
+
+        if [ $ret -eq 0 ]; then
+            echo "$result"
+            return 0
+        else
+            log_warn "curl failed (attempt $attempt/$max_attempts): $result"
+            attempt=$((attempt + 1))
+            [ $attempt -le $max_attempts ] && sleep 2
+        fi
+    done
+
+    log_error "curl failed after $max_attempts attempts"
+    return 1
+}
+
+# ================= Usage =================
 usage(){
   cat <<EOF
 Usage: $(basename "$0") [-h] [-i INDEX] [-p PCI_ADDR]
 
 Detect NVIDIA GPU on the host, update .env with GPU_ID and NVIDIA_VERSION,
-and print a recommended docker run command passing the GPU into the container.
+and print a recommended docker run command.
 
 Options:
   -h            Show this help
   -i INDEX      Select GPU by index (0-based)
-  -p PCI_ADDR   Select GPU by PCI address (short or full, e.g. 01:00.0 or 0000:01:00.0)
-
-If neither -i nor -p are provided the script will pick the first detected GPU.
-  -y            Non-interactive: automatically pick latest downloadable version
-  -v VERSION    Force NVIDIA_VERSION to VERSION (e.g. 530.41.03)
+  -p PCI_ADDR   Select GPU by PCI address
+  -y            Non-interactive: auto-pick latest
+  -v VERSION    Force NVIDIA_VERSION
 EOF
 }
 
-# 修复：检查.env.example是否存在，无则创建基础文件
+# ================= 环境文件检查 =================
 if [ ! -f "$ENV_EXAMPLE" ]; then
-  echo "Warning: .env.example not found at $ENV_EXAMPLE, creating empty file" >&2
-  touch "$ENV_EXAMPLE"
-  echo "GPU_ID=" >> "$ENV_EXAMPLE"
-  echo "NVIDIA_VERSION=" >> "$ENV_EXAMPLE"
+  log_warn ".env.example not found, creating empty file"
+  mkdir -p "$(dirname "$ENV_EXAMPLE")"
+  cat > "$ENV_EXAMPLE" <<'EOF'
+GPU_ID=
+NVIDIA_VERSION=
+PCI_FULL=
+EOF
 fi
 
 if [ ! -f "$ENV_FILE" ]; then
   cp "$ENV_EXAMPLE" "$ENV_FILE"
-  echo "Created $ENV_FILE from .env.example"
+  log_info "Created $ENV_FILE from .env.example"
 fi
 
+# ================= 参数解析 =================
 SELECT_INDEX=""
 SELECT_PCI=""
 AUTO_PICK_LATEST=0
@@ -53,33 +105,43 @@ while getopts ":hi:p:v:y" opt; do
     p) SELECT_PCI="$OPTARG";;
     v) FORCE_VERSION="$OPTARG";;
     y) AUTO_PICK_LATEST=1;;
-    :) die "Option -$OPTARG requires an argument";;
-    \?) die "Invalid option: -$OPTARG";;
+    :) log_error "Option -$OPTARG requires an argument"; exit 1;;
+    \?) log_error "Invalid option: -$OPTARG"; exit 1;;
   esac
 done
 
+# ================= GPU 检测 =================
 declare -a GPU_INDEX GPU_PCI_FULL GPU_PCI_SHORT GPU_NAME GPU_UUID
 
 detect_with_nvidia_smi(){
+  log_debug "Trying to detect with nvidia-smi..."
   if ! command -v nvidia-smi >/dev/null 2>&1; then
+    log_debug "nvidia-smi not found"
     return 1
   fi
-  mapfile -t lines < <(nvidia-smi --query-gpu=index,pci.bus_id,name,uuid --format=csv,noheader 2>/dev/null || true)
-  if [ "${#lines[@]}" -eq 0 ]; then
-    return 1
-  fi
-  for l in "${lines[@]}"; do
-    IFS=',' read -r idx pci rest <<< "$l"
-    uuid="${l##*,}"
-    name_and_middle="${l#*,}"
-    name_and_middle="${name_and_middle#*,}"
-    name="${name_and_middle%,*}"
 
-    idx="$(echo "$idx" | tr -d '[:space:]')"
-    pci="$(echo "$pci" | tr -d '[:space:]')"
-    pci_short="${pci#0000:}"
-    name="$(echo "$name" | sed 's/^ *//;s/ *$//')"
-    uuid="$(echo "$uuid" | tr -d '[:space:]')"
+  local lines=()
+  set +e
+  mapfile -t lines < <(nvidia-smi --query-gpu=index,pci.bus_id,name,uuid --format=csv,noheader 2>/dev/null)
+  local ret=$?
+  set -e
+
+  if [ $ret -ne 0 ] || [ ${#lines[@]} -eq 0 ]; then
+    log_debug "nvidia-smi returned no results"
+    return 1
+  fi
+
+  for l in "${lines[@]}"; do
+    log_debug "Parsing line: $l"
+    local idx pci rest uuid name_and_middle name
+
+    # 安全解析（避免管道错误）
+    idx=$(echo "$l" | cut -d',' -f1 | tr -d '[:space:]')
+    pci=$(echo "$l" | cut -d',' -f2 | tr -d '[:space:]')
+    uuid=$(echo "$l" | awk -F',' '{gsub(/[[:space:]]/, "", $NF); print $NF}')
+    name=$(echo "$l" | awk -F',' '{for(i=3;i<NF;i++) printf "%s", $i; print ""}' | sed 's/^ *//;s/ *$//')
+
+    local pci_short="${pci#0000:}"
 
     GPU_INDEX+=("$idx")
     GPU_PCI_FULL+=("$pci")
@@ -87,22 +149,35 @@ detect_with_nvidia_smi(){
     GPU_NAME+=("$name")
     GPU_UUID+=("$uuid")
   done
+
+  log_info "Detected ${#GPU_INDEX[@]} GPU(s) with nvidia-smi"
   return 0
 }
 
 detect_with_lspci(){
+  log_debug "Trying to detect with lspci..."
   if ! command -v lspci >/dev/null 2>&1; then
+    log_debug "lspci not found"
     return 1
   fi
-  mapfile -t lines < <(lspci -D 2>/dev/null | grep -iE 'vga|3d controller|display controller' | grep -i nvidia || true)
-  if [ "${#lines[@]}" -eq 0 ]; then
+
+  local lines=()
+  set +e
+  mapfile -t lines < <(lspci -D 2>/dev/null | grep -iE 'vga|3d controller|display controller' | grep -i nvidia)
+  local ret=$?
+  set -e
+
+  if [ $ret -ne 0 ] || [ ${#lines[@]} -eq 0 ]; then
+    log_debug "lspci returned no results"
     return 1
   fi
-  idx=0
+
+  local idx=0
   for l in "${lines[@]}"; do
-    pci="$(printf '%s' "$l" | awk '{print $1}')"
-    name="$(printf '%s' "$l" | cut -d ' ' -f3-)"
-    pci_short="${pci#0000:}"
+    local pci=$(echo "$l" | awk '{print $1}')
+    local name=$(echo "$l" | cut -d ' ' -f3-)
+    local pci_short="${pci#0000:}"
+
     GPU_INDEX+=("$idx")
     GPU_PCI_FULL+=("$pci")
     GPU_PCI_SHORT+=("$pci_short")
@@ -110,30 +185,47 @@ detect_with_lspci(){
     GPU_UUID+=("")
     idx=$((idx+1))
   done
+
+  log_info "Detected ${#GPU_INDEX[@]} GPU(s) with lspci"
   return 0
 }
 
-if ! detect_with_nvidia_smi && ! detect_with_lspci; then
-  die "No NVIDIA GPUs detected (no nvidia-smi and no lspci results)"
+# 执行检测（不使用 set -e，手动处理）
+log_info "Starting GPU detection..."
+detect_success=0
+if detect_with_nvidia_smi; then
+  detect_success=1
+elif detect_with_lspci; then
+  detect_success=1
 fi
 
-echo "Detected ${#GPU_INDEX[@]} NVIDIA GPU(s):"
+if [ $detect_success -ne 1 ]; then
+  log_error "No NVIDIA GPUs detected (neither nvidia-smi nor lspci worked)"
+  log_error "Please install NVIDIA drivers or pciutils and try again"
+  exit 1
+fi
+
+# ================= 打印检测结果 =================
+echo
+log_info "Detected ${#GPU_INDEX[@]} NVIDIA GPU(s):"
 for i in "${!GPU_INDEX[@]}"; do
-  printf "  [%s] index=%s pci=%s name=%s\n" "$i" "${GPU_INDEX[i]}" "${GPU_PCI_SHORT[i]}" "${GPU_NAME[i]}"
+  echo "  [$i] index=${GPU_INDEX[i]} pci=${GPU_PCI_SHORT[i]} name=${GPU_NAME[i]}"
 done
 
-# Choose GPU
+# ================= 选择 GPU =================
+chosen_idx=""
 if [ -n "$SELECT_INDEX" ]; then
   chosen_idx="$SELECT_INDEX"
 elif [ -n "$SELECT_PCI" ]; then
-  chosen_idx=""
   for i in "${!GPU_PCI_FULL[@]}"; do
     if [ "${GPU_PCI_FULL[i]}" = "$SELECT_PCI" ] || [ "${GPU_PCI_SHORT[i]}" = "$SELECT_PCI" ]; then
-      chosen_idx="$i"; break
+      chosen_idx="$i"
+      break
     fi
   done
   if [ -z "$chosen_idx" ]; then
-    die "No GPU matches PCI id $SELECT_PCI"
+    log_error "No GPU matches PCI id $SELECT_PCI"
+    exit 1
   fi
 else
   if [ "${#GPU_INDEX[@]}" -gt 1 ] && [ -t 0 ]; then
@@ -149,226 +241,113 @@ else
   fi
 fi
 
+# 验证选择
 if ! [[ "$chosen_idx" =~ ^[0-9]+$ ]]; then
-  die "Invalid GPU index selected: $chosen_idx"
+  log_error "Invalid GPU index: $chosen_idx"
+  exit 1
 fi
 if [ "$chosen_idx" -lt 0 ] || [ "$chosen_idx" -ge "${#GPU_INDEX[@]}" ]; then
-  die "Selected index out of range"
+  log_error "Index out of range: $chosen_idx"
+  exit 1
 fi
 
+# 获取选中的 GPU
 PCI_FULL="${GPU_PCI_FULL[$chosen_idx]}"
 PCI_SHORT="${GPU_PCI_SHORT[$chosen_idx]}"
 IDX="${GPU_INDEX[$chosen_idx]}"
 NAME="${GPU_NAME[$chosen_idx]}"
-UUID="${GPU_UUID[$chosen_idx]}"
+UUID="${GPU_UUID[$chosen_idx]:-}"
 
 echo
-echo "Selected GPU: index=$IDX pci=$PCI_SHORT name=$NAME"
+log_info "Selected GPU: index=$IDX pci=$PCI_SHORT name=$NAME"
 
-# Driver detection (best-effort)
+# ================= 驱动版本检测 =================
 DRIVER_VER=""
 DRIVER_SOURCE=""
+
 if command -v nvidia-smi >/dev/null 2>&1; then
-  DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  log_debug "Getting driver version from nvidia-smi..."
+  set +e
+  DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]')
+  set -e
   if [ -n "$DRIVER_VER" ]; then
     DRIVER_SOURCE="installed"
+    log_debug "Installed driver version: $DRIVER_VER"
   fi
 fi
 
 if [ -z "$DRIVER_VER" ] && command -v ubuntu-drivers >/dev/null 2>&1; then
-  rec_pkg="$(ubuntu-drivers devices 2>/dev/null | grep recommended | head -n1 | grep -Po 'nvidia-driver-[0-9]+' || true)"
+  log_debug "Getting recommended driver from ubuntu-drivers..."
+  set +e
+  rec_pkg=$(ubuntu-drivers devices 2>/dev/null | grep recommended | head -n1 | grep -Po 'nvidia-driver-[0-9]+' || true)
+  set -e
   if [ -n "$rec_pkg" ]; then
     DRIVER_VER="$rec_pkg"
     DRIVER_SOURCE="recommended"
+    log_debug "Recommended driver: $DRIVER_VER"
   fi
 fi
 
-if [ -z "$DRIVER_VER" ] && command -v nvidia-detect >/dev/null 2>&1; then
-  DRIVER_VER="$(nvidia-detect 2>/dev/null | head -n1 || true)"
-  if [ -n "$DRIVER_VER" ]; then
-    DRIVER_SOURCE="detected"
-  fi
-fi
-
-find_latest_available_driver(){
-  declare -a cand
-  local tmp
-  if command -v ubuntu-drivers >/dev/null 2>&1; then
-    mapfile -t tmp < <(ubuntu-drivers devices 2>/dev/null | grep -Po 'nvidia-driver-[0-9]+' || true)
-    for x in "${tmp[@]}"; do cand+=("$x"); done
-  fi
-  if command -v apt-cache >/dev/null 2>&1; then
-    mapfile -t tmp < <(apt-cache search '^nvidia-driver-[0-9]+' 2>/dev/null | grep -Po 'nvidia-driver-[0-9]+' || true)
-    for x in "${tmp[@]}"; do cand+=("$x"); done
-  fi
-  if command -v dnf >/dev/null 2>&1; then
-    mapfile -t tmp < <(dnf --quiet list available 'nvidia-driver*' 2>/dev/null | awk '{print $1}' | grep -Po 'nvidia[-._]?driver[-._]?[0-9]+' || true)
-    for x in "${tmp[@]}"; do cand+=("$x"); done
-  fi
-
-  if [ "${#cand[@]}" -eq 0 ]; then
-    return 1
-  fi
-  mapfile -t uniqs < <(printf "%s\n" "${cand[@]}" | sort -u)
-
-  best_pkg=""
-  best_num=0
-  for p in "${uniqs[@]}"; do
-    if [[ "$p" =~ ([0-9]{3,4}) ]]; then
-      num="${BASH_REMATCH[1]}"
-      if [ -z "$best_pkg" ] || ((num > best_num)); then
-        best_num="$num"
-        best_pkg="$p"
-      fi
-    fi
-  done
-  if [ -n "$best_pkg" ]; then
-    printf '%s' "$best_pkg"
-    return 0
-  fi
-  printf '%s' "${uniqs[0]}"
-  return 0
-}
-
-if [ -z "$DRIVER_VER" ]; then
-  if cand_pkg="$(find_latest_available_driver 2>/dev/null || true)"; then
-    if [ -n "$cand_pkg" ]; then
-      DRIVER_VER="$cand_pkg"
-      DRIVER_SOURCE="available"
-    fi
-  fi
-fi
-
-# 修复：增加curl依赖检查，避免无curl时脚本退出
-DOWNLOAD_VERSIONS_RAW=""
+# ================= 下载版本检测 =================
 DOWNLOAD_VERSIONS=()
 DOWNLOAD_SORTED=()
-if command -v curl >/dev/null 2>&1; then
-  DOWNLOAD_VERSIONS_RAW="$(curl -fsSL --retry 2 --max-time 10 'https://download.nvidia.com/XFree86/Linux-x86_64/' 2>/dev/null || true)"
-else
-  echo "Warning: curl not found, skip downloadable version check" >&2
-fi
-
-if [ -n "$DOWNLOAD_VERSIONS_RAW" ]; then
-  mapfile -t DOWNLOAD_VERSIONS < <(printf '%s\n' "$DOWNLOAD_VERSIONS_RAW" | grep -oE '([0-9]+\.[0-9]+(\.[0-9]+)*)/' | sed 's:/$::' | sort -V -u)
-fi
-
 DOWNLOAD_VER=""
 DOWNLOAD_SOURCE=""
 
-check_downloadable(){
-  local ver="$1"
-  local url="https://download.nvidia.com/XFree86/Linux-x86_64/${ver}/NVIDIA-Linux-x86_64-${ver}.run"
-  if command -v curl >/dev/null 2>&1; then
-    if curl -sfI -L --max-time 10 "$url" >/dev/null 2>&1; then
-      return 0
-    fi
+if command -v curl >/dev/null 2>&1; then
+  log_info "Fetching available NVIDIA driver versions..."
+  set +e
+  DOWNLOAD_VERSIONS_RAW=$(curl_retry 'https://download.nvidia.com/XFree86/Linux-x86_64/')
+  set -e
+
+  if [ -n "$DOWNLOAD_VERSIONS_RAW" ]; then
+    log_debug "Parsing download versions..."
+    set +e
+    mapfile -t DOWNLOAD_VERSIONS < <(echo "$DOWNLOAD_VERSIONS_RAW" | grep -oE '([0-9]+\.[0-9]+(\.[0-9]+)*)/' | sed 's:/$::' | sort -V -u)
+    set -e
+    log_debug "Found ${#DOWNLOAD_VERSIONS[@]} downloadable versions"
   fi
-  return 1
-}
+fi
 
-if [ "${#DOWNLOAD_VERSIONS[@]}" -gt 0 ]; then
-  mapfile -t DOWNLOAD_SORTED < <(printf '%s\n' "${DOWNLOAD_VERSIONS[@]}" | sort -V -r)
+# 排序（降序）
+if [ ${#DOWNLOAD_VERSIONS[@]} -gt 0 ]; then
+  set +e
+  mapfile -t DOWNLOAD_SORTED < <(printf "%s\n" "${DOWNLOAD_VERSIONS[@]}" | sort -V -r)
+  set -e
+fi
 
+# ================= 版本匹配逻辑 =================
+if [ -n "${FORCE_VERSION:-}" ]; then
+  if [[ "$FORCE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    DOWNLOAD_VER="$FORCE_VERSION"
+    DOWNLOAD_SOURCE="forced"
+  else
+    log_error "Invalid version format: $FORCE_VERSION"
+    exit 1
+  fi
+elif [ ${#DOWNLOAD_SORTED[@]} -gt 0 ]; then
+  # 尝试精确匹配
   if [ -n "$DRIVER_VER" ]; then
     for v in "${DOWNLOAD_SORTED[@]}"; do
       if [ "$v" = "$DRIVER_VER" ]; then
         DOWNLOAD_VER="$v"
-        DOWNLOAD_SOURCE="match-installed-or-candidate"
+        DOWNLOAD_SOURCE="match-installed"
         break
       fi
     done
-    if [ -z "$DOWNLOAD_VER" ]; then
-      maj=""
-      if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
-        maj="${BASH_REMATCH[1]}"
-      elif [[ "$DRIVER_VER" =~ ^([0-9]+)$ ]]; then
-        maj="${BASH_REMATCH[1]}"
-      elif [[ "$DRIVER_VER" =~ ^([0-9]+)\.[0-9]+ ]]; then
-        maj="${BASH_REMATCH[1]}"
-      fi
-      if [ -n "$maj" ]; then
-        for v in "${DOWNLOAD_SORTED[@]}"; do
-          if [[ "$v" == "$maj."* ]]; then
-            DOWNLOAD_VER="$v"
-            DOWNLOAD_SOURCE="mapped-major"
-            break
-          fi
-        done
-      fi
-    fi
   fi
 
-  # 修复：检查数组非空后再取值，避免set -u
-  if [ -z "$DOWNLOAD_VER" ]; then
-    if [ ${#DOWNLOAD_SORTED[@]} -gt 0 ]; then
-      DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
-      DOWNLOAD_SOURCE="latest"
-    else
-      DOWNLOAD_VER=""
-      DOWNLOAD_SOURCE="none"
-    fi
-  fi
-
-  if [ -n "$DOWNLOAD_VER" ]; then
-    if ! check_downloadable "$DOWNLOAD_VER"; then
-      for v in "${DOWNLOAD_SORTED[@]}"; do
-        if check_downloadable "$v"; then
-          DOWNLOAD_VER="$v"
-          DOWNLOAD_SOURCE="verified"
-          break
-        fi
-      done
-    fi
-  fi
-fi
-
-# Backup and update .env
-cp "$ENV_FILE" "$ENV_FILE.bak.$TS"
-
-set_env(){
-  key="$1"
-  val="$2"
-  file="$3"
-  esc_val="$(printf '%s' "$val" | sed -e 's/[\/&]/\\&/g')"
-  if grep -qE "^${key}=" "$file"; then
-    sed -E "s/^(${key})=.*/\1=${esc_val}/" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
-  else
-    echo "${key}=${val}" >> "$file"
-  fi
-}
-
-set_env "GPU_ID" "$PCI_SHORT" "$ENV_FILE"
-set_env "PCI_FULL" "$PCI_FULL" "$ENV_FILE"
-
-ensure_concrete_version(){
-  if [ -n "${FORCE_VERSION:-}" ]; then
-    if [[ "$FORCE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-      DOWNLOAD_VER="$FORCE_VERSION"
-      DOWNLOAD_SOURCE="forced"
-      return 0
-    else
-      die "Invalid format for -v: $FORCE_VERSION (expected numeric like 530.41.03)"
-    fi
-  fi
-  if [ -n "$DOWNLOAD_VER" ]; then
-    return 0
-  fi
-  if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-    DOWNLOAD_VER="$DRIVER_VER"
-    DOWNLOAD_SOURCE="driver-numeric"
-    return 0
-  fi
-
-  if [ "${#DOWNLOAD_SORTED[@]}" -gt 0 ] && [ -n "$DRIVER_VER" ]; then
-    maj=""
+  # 尝试主版本匹配
+  if [ -z "$DOWNLOAD_VER" ] && [ -n "$DRIVER_VER" ]; then
+    local maj=""
     if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
-      maj="${BASH_REMATCH[1]}"
-    elif [[ "$DRIVER_VER" =~ ^([0-9]+)$ ]]; then
       maj="${BASH_REMATCH[1]}"
     elif [[ "$DRIVER_VER" =~ ^([0-9]+)\.[0-9]+ ]]; then
       maj="${BASH_REMATCH[1]}"
+    elif [[ "$DRIVER_VER" =~ ^([0-9]+)$ ]]; then
+      maj="${BASH_REMATCH[1]}"
     fi
+
     if [ -n "$maj" ]; then
       for v in "${DOWNLOAD_SORTED[@]}"; do
         if [[ "$v" == "$maj."* ]]; then
@@ -380,112 +359,73 @@ ensure_concrete_version(){
     fi
   fi
 
+  # 用最新版本
   if [ -z "$DOWNLOAD_VER" ]; then
-    if [ "${#DOWNLOAD_SORTED[@]}" -gt 0 ]; then
-      if [ "$AUTO_PICK_LATEST" -eq 1 ] || [ ! -t 0 ]; then
-        DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
-        DOWNLOAD_SOURCE="auto-latest"
-      else
-        echo "\nCould not automatically resolve a concrete NVIDIA driver version from '$DRIVER_VER'."
-        echo "Available downloadable versions (top 10):"
-        i=0
-        for v in "${DOWNLOAD_SORTED[@]}"; do
-          printf '  [%d] %s\n' "$i" "$v"
-          i=$((i+1))
-          if [ "$i" -ge 10 ]; then break; fi
-        done
-        echo -n "Enter index to pick, or type a full version like 530.41.03 (leave empty to abort): "
-        read -r user_choice || true
-        if [ -z "$user_choice" ]; then
-          die "No concrete NVIDIA_VERSION selected; please set NVIDIA_VERSION in $ENV_FILE (e.g. NVIDIA_VERSION=530.41.03) and re-run"
-        fi
-        if [[ "$user_choice" =~ ^[0-9]+$ ]]; then
-          sel="$user_choice"
-          candidate="${DOWNLOAD_SORTED[$sel]:-}"
-          if [ -n "$candidate" ]; then
-            DOWNLOAD_VER="$candidate"
-            DOWNLOAD_SOURCE="user-picked"
-          else
-            die "Invalid selection index: $sel"
-          fi
-        else
-          if [[ "$user_choice" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-            DOWNLOAD_VER="$user_choice"
-            DOWNLOAD_SOURCE="user-input"
-          else
-            die "Invalid version format: $user_choice"
-          fi
-        fi
-      fi
-    else
-      if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-        DOWNLOAD_VER="$DRIVER_VER"
-        DOWNLOAD_SOURCE="driver-numeric"
-      else
-        if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
-          maj="${BASH_REMATCH[1]}"
-          if command -v apt-cache >/dev/null 2>&1; then
-            pkg="$DRIVER_VER"
-            cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
-            if [ -n "$cand" ]; then
-              if [[ "$cand" =~ ([0-9]+\.[0-9]+(\.[0-9]+)*) ]]; then
-                DOWNLOAD_VER="${BASH_REMATCH[1]}"
-                DOWNLOAD_SOURCE="apt-candidate"
-                return 0
-              fi
-            fi
-            cand="$(apt-cache madison "$pkg" 2>/dev/null | awk '{print $3; exit}')"
-            if [ -n "$cand" ]; then
-              if [[ "$cand" =~ ([0-9]+\.[0-9]+(\.[0-9]+)*) ]]; then
-                DOWNLOAD_VER="${BASH_REMATCH[1]}"
-                DOWNLOAD_SOURCE="apt-madison"
-                return 0
-              fi
-            fi
-          fi
-          DOWNLOAD_VER="${maj}.0.0"
-          DOWNLOAD_SOURCE="fallback-major"
-          echo "[setup_nvidia_for_docker] Warning: no upstream list found; using fallback NVIDIA_VERSION=${DOWNLOAD_VER} derived from ${DRIVER_VER}" >&2
-        else
-          echo "[setup_nvidia_for_docker] Automatic version detection failed. Debug info:" >&2
-          echo "  DRIVER_VER='${DRIVER_VER:-}'" >&2
-          echo "  DOWNLOAD_VERSIONS_RAW length: $(printf '%s' "${DOWNLOAD_VERSIONS_RAW:-}" | wc -c)" >&2
-          echo "  DOWNLOAD_SORTED count: ${#DOWNLOAD_SORTED[@]}" >&2
-          echo "  curl available: $(command -v curl >/dev/null 2>&1 && echo yes || echo no)" >&2
-          echo "  ubuntu-drivers available: $(command -v ubuntu-drivers >/dev/null 2>&1 && echo yes || echo no)" >&2
-          echo "  apt-cache available: $(command -v apt-cache >/dev/null 2>&1 && echo yes || echo no)" >&2
-          die "Unable to determine concrete NVIDIA_VERSION automatically. Please set NVIDIA_VERSION in $ENV_FILE manually (e.g. NVIDIA_VERSION=530.41.03) and re-run"
-        fi
-      fi
-    fi
+    DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
+    DOWNLOAD_SOURCE="latest"
+  fi
+else
+  # 没有下载列表，用检测到的版本
+  if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    DOWNLOAD_VER="$DRIVER_VER"
+    DOWNLOAD_SOURCE="driver-numeric"
+  else
+    log_warn "Could not determine exact NVIDIA_VERSION"
+    DOWNLOAD_VER="${DRIVER_VER:-}"
+    DOWNLOAD_SOURCE="unknown"
+  fi
+fi
+
+# ================= 更新 .env 文件 =================
+log_info "Updating .env file..."
+cp "$ENV_FILE" "$ENV_FILE.bak.$TS"
+
+set_env(){
+  local key="$1"
+  local val="$2"
+  local file="$3"
+
+  log_debug "Setting $key=$val in $file"
+
+  # 安全的 sed 替换
+  if grep -qE "^${key}=" "$file"; then
+    # 使用临时文件避免 sed 错误
+    local tmpfile=$(mktemp)
+    sed -E "s/^(${key})=.*/\1=${val//\//\\/}/" "$file" > "$tmpfile" && mv "$tmpfile" "$file"
+  else
+    echo "${key}=${val}" >> "$file"
   fi
 }
 
-ensure_concrete_version
-
+set_env "GPU_ID" "$PCI_SHORT" "$ENV_FILE"
+set_env "PCI_FULL" "$PCI_FULL" "$ENV_FILE"
 set_env "NVIDIA_VERSION" "${DOWNLOAD_VER:-}" "$ENV_FILE"
 
+# ================= 最终输出 =================
 echo
 if [ -n "$DOWNLOAD_VER" ]; then
-  echo "Updated $ENV_FILE -> GPU_ID=$PCI_SHORT NVIDIA_VERSION=$DOWNLOAD_VER (download-source: ${DOWNLOAD_SOURCE:-unknown}, driver-source: ${DRIVER_SOURCE:-none})"
+  log_info "Successfully updated $ENV_FILE"
+  echo "  GPU_ID=$PCI_SHORT"
+  echo "  PCI_FULL=$PCI_FULL"
+  echo "  NVIDIA_VERSION=$DOWNLOAD_VER"
+  echo "  (source: download=${DOWNLOAD_SOURCE:-unknown}, driver=${DRIVER_SOURCE:-none})"
 else
-  echo "Updated $ENV_FILE -> GPU_ID=$PCI_SHORT NVIDIA_VERSION=${DRIVER_VER:-<not-detected>} (no downloadable match found)"
+  log_warn "Updated $ENV_FILE with partial information"
+  echo "  GPU_ID=$PCI_SHORT"
+  echo "  NVIDIA_VERSION=${DRIVER_VER:-<not-detected>}"
 fi
 
+echo
 cat <<EOF
-
-Docker run example (requires nvidia-container-toolkit / NVIDIA Container Runtime):
-
-  docker run --rm --gpus "device=${PCI_FULL}" \
-    -e GPU_ID=${PCI_SHORT} \
-    -e NVIDIA_VERSION=${DRIVER_VER:-} \
+Docker run example:
+  docker run --rm --gpus "device=${PCI_FULL}" \\
+    -e GPU_ID=${PCI_SHORT} \\
+    -e NVIDIA_VERSION=${DOWNLOAD_VER:-${DRIVER_VER:-}} \\
     <your-image>
 
-Notes:
-  - Many images read NVIDIA_VISIBLE_DEVICES / GPU env vars. You can also use
-    -e NVIDIA_VISIBLE_DEVICES=${PCI_FULL} when using docker-compose.
-  - The script updated .env (backup: ${ENV_FILE}.bak.${TS}). Double-check values if needed.
-
+Backup created: $ENV_FILE.bak.$TS
 EOF
 
+log_info "Done!"
 exit 0
+
