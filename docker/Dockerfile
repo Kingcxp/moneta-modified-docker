@@ -21,5 +21,6 @@ COPY --chown=root:root scripts/entrypoint.sh /workspace/entrypoint.sh
 
 RUN chmod +x /workspace/moneta/scripts/*.sh
 RUN chmod +x /workspace/moneta/build.sh
+RUN chmod +x /workspace/entrypoint.sh
 
 ENTRYPOINT [ "/workspace/entrypoint.sh" ]

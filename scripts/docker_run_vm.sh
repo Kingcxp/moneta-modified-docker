@@ -202,6 +202,26 @@ if [ "$CONFIRM" -eq 1 ] || [ "$IOMMU_OK" -eq 1 ]; then
   fi
 fi
 
+# Try to determine VFIO IOMMU group for the device so we can pass device node
+# into the container explicitly (in addition to --privileged). This helps
+# ensure QEMU in the container can access the correct /dev/vfio/* node.
+IOMMU_GROUP=""
+if [ -e "/sys/bus/pci/devices/$PCI_FULL/iommu_group" ]; then
+  IOMMU_GROUP=$(basename "$(readlink -f "/sys/bus/pci/devices/$PCI_FULL/iommu_group")")
+  # wait briefly for device node to appear
+  for i in 1 2 3 4 5; do
+    if [ -e "/dev/vfio/$IOMMU_GROUP" ]; then
+      break
+    fi
+    sleep 0.5
+  done
+fi
+
+DOCKER_DEV_ARGS="--device /dev/vfio/vfio"
+if [ -n "$IOMMU_GROUP" ] && [ -e "/dev/vfio/$IOMMU_GROUP" ]; then
+  DOCKER_DEV_ARGS="$DOCKER_DEV_ARGS --device /dev/vfio/$IOMMU_GROUP"
+fi
+
 # Determine image name
 IMAGE_NAME="${IMAGE_ARG:-${DOCKER_IMAGE:-}}"
 if [ -z "$IMAGE_NAME" ]; then
@@ -221,6 +241,6 @@ echo "  (container will mount this repo at /workspace)"
 
 # Run container in foreground; when it exits cleanup trap will run
 run_as_root "docker run --rm --privileged --name moneta-nvidia \
-  --env-file $REPO_ROOT/.env -e PCI_FULL=${PCI_FULL} \
+  ${DOCKER_DEV_ARGS} --env-file $REPO_ROOT/.env -e PCI_FULL=${PCI_FULL} \
   ${IMAGE_NAME}"
 

@@ -24,6 +24,8 @@ Options:
   -p PCI_ADDR   Select GPU by PCI address (short or full, e.g. 01:00.0 or 0000:01:00.0)
 
 If neither -i nor -p are provided the script will pick the first detected GPU.
+  -y            Non-interactive: automatically pick latest downloadable version
+  -v VERSION    Force NVIDIA_VERSION to VERSION (e.g. 530.41.03)
 EOF
 }
 
@@ -38,11 +40,15 @@ fi
 
 SELECT_INDEX=""
 SELECT_PCI=""
-while getopts ":hi:p:" opt; do
+AUTO_PICK_LATEST=0
+FORCE_VERSION=""
+while getopts ":hi:p:v:y" opt; do
   case "$opt" in
     h) usage; exit 0;;
     i) SELECT_INDEX="$OPTARG";;
     p) SELECT_PCI="$OPTARG";;
+    v) FORCE_VERSION="$OPTARG";;
+    y) AUTO_PICK_LATEST=1;;
     :) die "Option -$OPTARG requires an argument";;
     \?) die "Invalid option: -$OPTARG";;
   esac
@@ -248,6 +254,7 @@ fi
 # exists. Fetch the directory index and pick a matching/full version if possible.
 DOWNLOAD_VERSIONS_RAW=""
 DOWNLOAD_VERSIONS=()
+DOWNLOAD_SORTED=()
 if command -v curl >/dev/null 2>&1; then
   DOWNLOAD_VERSIONS_RAW="$(curl -fsSL --retry 2 --max-time 10 'https://download.nvidia.com/XFree86/Linux-x86_64/' 2>/dev/null || true)"
 fi
@@ -346,14 +353,144 @@ set_env(){
 }
 
 set_env "GPU_ID" "$PCI_SHORT" "$ENV_FILE"
-if [ -n "$DOWNLOAD_VER" ]; then
-  set_env "NVIDIA_VERSION" "$DOWNLOAD_VER" "$ENV_FILE"
-else
-  # fallback: use whatever driver string we found earlier
-  if [ -n "$DRIVER_VER" ]; then
-    set_env "NVIDIA_VERSION" "$DRIVER_VER" "$ENV_FILE"
+set_env "PCI_FULL" "$PCI_FULL" "$ENV_FILE"
+# Ensure we write a concrete NVIDIA_VERSION (numeric like 530.41.03).
+ensure_concrete_version(){
+  # If the user forced a version via -v, accept it (must be numeric dotted form).
+  if [ -n "${FORCE_VERSION:-}" ]; then
+    if [[ "$FORCE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+      DOWNLOAD_VER="$FORCE_VERSION"
+      DOWNLOAD_SOURCE="forced"
+      return 0
+    else
+      die "Invalid format for -v: $FORCE_VERSION (expected numeric like 530.41.03)"
+    fi
   fi
-fi
+  # If we already have a downloadable full version, use it.
+  if [ -n "$DOWNLOAD_VER" ]; then
+    return 0
+  fi
+  # If driver string is already numeric/dotted, accept it.
+  if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    DOWNLOAD_VER="$DRIVER_VER"
+    DOWNLOAD_SOURCE="driver-numeric"
+    return 0
+  fi
+
+  # Try to map package-like candidates (nvidia-driver-535) to a full downloadable version
+  if [ "${#DOWNLOAD_SORTED[@]}" -gt 0 ] && [ -n "$DRIVER_VER" ]; then
+    maj=""
+    if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
+      maj="${BASH_REMATCH[1]}"
+    elif [[ "$DRIVER_VER" =~ ^([0-9]+)$ ]]; then
+      maj="${BASH_REMATCH[1]}"
+    elif [[ "$DRIVER_VER" =~ ^([0-9]+)\.[0-9]+ ]]; then
+      maj="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$maj" ]; then
+      for v in "${DOWNLOAD_SORTED[@]}"; do
+        if [[ "$v" == "$maj."* ]]; then
+          DOWNLOAD_VER="$v"
+          DOWNLOAD_SOURCE="mapped-major"
+          break
+        fi
+      done
+    fi
+  fi
+
+  # If still not found, either auto-pick latest in non-interactive/auto mode,
+  # or interactively prompt the user to choose.
+  if [ -z "$DOWNLOAD_VER" ]; then
+    if [ "${#DOWNLOAD_SORTED[@]}" -gt 0 ]; then
+      if [ "$AUTO_PICK_LATEST" -eq 1 ] || [ ! -t 0 ]; then
+        # Non-interactive or auto-flag: choose the latest available
+        DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
+        DOWNLOAD_SOURCE="auto-latest"
+      else
+        echo "\nCould not automatically resolve a concrete NVIDIA driver version from '$DRIVER_VER'."
+        echo "Available downloadable versions (top 10):"
+        i=0
+        for v in "${DOWNLOAD_SORTED[@]}"; do
+          printf '  [%d] %s\n' "$i" "$v"
+          i=$((i+1))
+          if [ "$i" -ge 10 ]; then break; fi
+        done
+        echo -n "Enter index to pick, or type a full version like 530.41.03 (leave empty to abort): "
+        read -r user_choice || true
+        if [ -z "$user_choice" ]; then
+          die "No concrete NVIDIA_VERSION selected; please set NVIDIA_VERSION in $ENV_FILE (e.g. NVIDIA_VERSION=530.41.03) and re-run"
+        fi
+        if [[ "$user_choice" =~ ^[0-9]+$ ]]; then
+          sel="$user_choice"
+          candidate="${DOWNLOAD_SORTED[$sel]:-}"
+          if [ -n "$candidate" ]; then
+            DOWNLOAD_VER="$candidate"
+            DOWNLOAD_SOURCE="user-picked"
+          else
+            die "Invalid selection index: $sel"
+          fi
+        else
+          if [[ "$user_choice" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            DOWNLOAD_VER="$user_choice"
+            DOWNLOAD_SOURCE="user-input"
+          else
+            die "Invalid version format: $user_choice"
+          fi
+        fi
+      fi
+    else
+      # No downloadable list found; try to use numeric DRIVER_VER if present
+      if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+        DOWNLOAD_VER="$DRIVER_VER"
+        DOWNLOAD_SOURCE="driver-numeric"
+      else
+        # If DRIVER_VER is a package-like name (nvidia-driver-580), try to extract
+        # a concrete numeric version from package metadata (apt-cache). If that
+        # fails, fall back to a best-effort major-version-derived string.
+        if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
+          maj="${BASH_REMATCH[1]}"
+          if command -v apt-cache >/dev/null 2>&1; then
+            pkg="$DRIVER_VER"
+            cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+            if [ -n "$cand" ]; then
+              if [[ "$cand" =~ ([0-9]+\.[0-9]+(\.[0-9]+)*) ]]; then
+                DOWNLOAD_VER="${BASH_REMATCH[1]}"
+                DOWNLOAD_SOURCE="apt-candidate"
+                return 0
+              fi
+            fi
+            cand="$(apt-cache madison "$pkg" 2>/dev/null | awk '{print $3; exit}')"
+            if [ -n "$cand" ]; then
+              if [[ "$cand" =~ ([0-9]+\.[0-9]+(\.[0-9]+)*) ]]; then
+                DOWNLOAD_VER="${BASH_REMATCH[1]}"
+                DOWNLOAD_SOURCE="apt-madison"
+                return 0
+              fi
+            fi
+          fi
+          # Fallback: synthesize a version using the major (best-effort)
+          DOWNLOAD_VER="${maj}.0.0"
+          DOWNLOAD_SOURCE="fallback-major"
+          echo "[setup_nvidia_for_docker] Warning: no upstream list found; using fallback NVIDIA_VERSION=${DOWNLOAD_VER} derived from ${DRIVER_VER}" >&2
+        else
+          # Diagnostic output to help the user understand why automatic detection failed
+          echo "[setup_nvidia_for_docker] Automatic version detection failed. Debug info:" >&2
+          echo "  DRIVER_VER='${DRIVER_VER:-}'" >&2
+          echo "  DOWNLOAD_VERSIONS_RAW length: $(printf '%s' "${DOWNLOAD_VERSIONS_RAW:-}" | wc -c)" >&2
+          echo "  DOWNLOAD_SORTED count: ${#DOWNLOAD_SORTED[@]}" >&2
+          echo "  curl available: $(command -v curl >/dev/null 2>&1 && echo yes || echo no)" >&2
+          echo "  ubuntu-drivers available: $(command -v ubuntu-drivers >/dev/null 2>&1 && echo yes || echo no)" >&2
+          echo "  apt-cache available: $(command -v apt-cache >/dev/null 2>&1 && echo yes || echo no)" >&2
+          die "Unable to determine concrete NVIDIA_VERSION automatically. Please set NVIDIA_VERSION in $ENV_FILE manually (e.g. NVIDIA_VERSION=530.41.03) and re-run"
+        fi
+      fi
+    fi
+  fi
+}
+
+ensure_concrete_version
+
+set_env "NVIDIA_VERSION" "$DOWNLOAD_VER" "$ENV_FILE"
 
 echo
 if [ -n "$DOWNLOAD_VER" ]; then
