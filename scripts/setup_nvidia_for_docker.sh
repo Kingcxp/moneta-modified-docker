@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 
-# ================= 核心设置（修改版） =================
-# 保留 pipefail，但不使用 set -e，我们手动处理错误
+# ================= 核心设置 =================
 set -uo pipefail
-shopt -s nullglob  # 处理空数组
+shopt -s nullglob
 
 # ================= 全局变量 =================
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 ENV_FILE="$REPO_ROOT/.env"
 TS=$(date +%s)
-DEBUG=1  # 开启调试日志
+DEBUG=1
 
 # ================= 日志函数 =================
 log_info() { echo -e "\033[0;32m[INFO]\033[0m $*" >&2; }
@@ -19,7 +18,6 @@ log_error() { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; }
 log_debug() { [ "$DEBUG" -eq 1 ] && echo -e "\033[0;34m[DEBUG]\033[0m $*" >&2; }
 
 # ================= 安全的命令执行函数 =================
-# 替代直接执行命令，捕获错误但不退出
 run_safe() {
     log_debug "Executing: $*"
     set +e
@@ -135,7 +133,6 @@ detect_with_nvidia_smi(){
     log_debug "Parsing line: $l"
     local idx pci rest uuid name_and_middle name
 
-    # 安全解析（避免管道错误）
     idx=$(echo "$l" | cut -d',' -f1 | tr -d '[:space:]')
     pci=$(echo "$l" | cut -d',' -f2 | tr -d '[:space:]')
     uuid=$(echo "$l" | awk -F',' '{gsub(/[[:space:]]/, "", $NF); print $NF}')
@@ -190,7 +187,6 @@ detect_with_lspci(){
   return 0
 }
 
-# 执行检测（不使用 set -e，手动处理）
 log_info "Starting GPU detection..."
 detect_success=0
 if detect_with_nvidia_smi; then
@@ -241,7 +237,6 @@ else
   fi
 fi
 
-# 验证选择
 if ! [[ "$chosen_idx" =~ ^[0-9]+$ ]]; then
   log_error "Invalid GPU index: $chosen_idx"
   exit 1
@@ -251,7 +246,6 @@ if [ "$chosen_idx" -lt 0 ] || [ "$chosen_idx" -ge "${#GPU_INDEX[@]}" ]; then
   exit 1
 fi
 
-# 获取选中的 GPU
 PCI_FULL="${GPU_PCI_FULL[$chosen_idx]}"
 PCI_SHORT="${GPU_PCI_SHORT[$chosen_idx]}"
 IDX="${GPU_INDEX[$chosen_idx]}"
@@ -309,7 +303,6 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
-# 排序（降序）
 if [ ${#DOWNLOAD_VERSIONS[@]} -gt 0 ]; then
   set +e
   mapfile -t DOWNLOAD_SORTED < <(printf "%s\n" "${DOWNLOAD_VERSIONS[@]}" | sort -V -r)
@@ -326,7 +319,6 @@ if [ -n "${FORCE_VERSION:-}" ]; then
     exit 1
   fi
 elif [ ${#DOWNLOAD_SORTED[@]} -gt 0 ]; then
-  # 尝试精确匹配
   if [ -n "$DRIVER_VER" ]; then
     for v in "${DOWNLOAD_SORTED[@]}"; do
       if [ "$v" = "$DRIVER_VER" ]; then
@@ -337,9 +329,8 @@ elif [ ${#DOWNLOAD_SORTED[@]} -gt 0 ]; then
     done
   fi
 
-  # 尝试主版本匹配
   if [ -z "$DOWNLOAD_VER" ] && [ -n "$DRIVER_VER" ]; then
-    local maj=""
+    maj=""
     if [[ "$DRIVER_VER" =~ ^nvidia-driver-([0-9]+)$ ]]; then
       maj="${BASH_REMATCH[1]}"
     elif [[ "$DRIVER_VER" =~ ^([0-9]+)\.[0-9]+ ]]; then
@@ -359,13 +350,11 @@ elif [ ${#DOWNLOAD_SORTED[@]} -gt 0 ]; then
     fi
   fi
 
-  # 用最新版本
   if [ -z "$DOWNLOAD_VER" ]; then
     DOWNLOAD_VER="${DOWNLOAD_SORTED[0]}"
     DOWNLOAD_SOURCE="latest"
   fi
 else
-  # 没有下载列表，用检测到的版本
   if [[ "$DRIVER_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
     DOWNLOAD_VER="$DRIVER_VER"
     DOWNLOAD_SOURCE="driver-numeric"
@@ -387,9 +376,7 @@ set_env(){
 
   log_debug "Setting $key=$val in $file"
 
-  # 安全的 sed 替换
   if grep -qE "^${key}=" "$file"; then
-    # 使用临时文件避免 sed 错误
     local tmpfile=$(mktemp)
     sed -E "s/^(${key})=.*/\1=${val//\//\\/}/" "$file" > "$tmpfile" && mv "$tmpfile" "$file"
   else
