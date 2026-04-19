@@ -3,6 +3,9 @@ FROM ubuntu:22.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 
+RUN echo "kexec-tools kexec-tools/load_kexec boolean false" | debconf-set-selections
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt update && apt install -y --no-install-recommends \
     sudo \
     micro \
