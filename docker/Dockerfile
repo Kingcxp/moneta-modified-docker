@@ -23,7 +23,7 @@ RUN apt update && apt install -y --no-install-recommends \
     pkg-config \
     cmake \
     python-is-python3 \
-    golang-1.18-go \
+    golang-go \
     libelf-dev \
     debootstrap \
     libslirp-dev \
