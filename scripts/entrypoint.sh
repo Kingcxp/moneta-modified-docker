@@ -3,4 +3,4 @@ set -euo pipefail
 
 cd /workspace/moneta
 
-exec ./build.sh
+bash ./build.sh

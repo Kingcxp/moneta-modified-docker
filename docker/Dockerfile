@@ -12,7 +12,48 @@ RUN apt update && apt install -y --no-install-recommends \
     wget \
     vim \
     expect \
-    && rm -rf /var/lib/apt/lists/*
+    python3 \
+    git \
+    libglib2.0-dev \
+    libfdt-dev \
+    libpixman-1-dev \
+    zlib1g-dev \
+    ninja-build \
+    build-essential \
+    pkg-config \
+    cmake \
+    python-is-python3 \
+    golang-1.18-go \
+    libelf-dev \
+    debootstrap \
+    libslirp-dev \
+    libncurses-dev \
+    gawk \
+    flex \
+    bison \
+    openssl \
+    libssl-dev \
+    dkms \
+    libelf-dev \
+    libudev-dev \
+    libpci-dev \
+    libiberty-dev \
+    autoconf \
+    llvm \
+    flex \
+    fakeroot \
+    crash \
+    kexec-tools \
+    makedumpfile \
+    kernel-wedge \
+    libncurses5 \
+    libncurses5-dev \
+    asciidoc \
+    binutils-dev \
+    libcap-dev \
+    default-jdk \
+    curl \
+    zstd
 
 WORKDIR /workspace
 
