@@ -53,7 +53,8 @@ RUN apt update && apt install -y --no-install-recommends \
     libcap-dev \
     default-jdk \
     curl \
-    zstd
+    zstd \
+    linux-modules-extra-$(uname -r) \
 
 WORKDIR /workspace
 
