@@ -54,7 +54,9 @@ RUN apt update && apt install -y --no-install-recommends \
     default-jdk \
     curl \
     zstd \
-    linux-modules-extra-$(uname -r)
+    linux-modules-extra-$(uname -r) \
+    bc \
+    linux-firmware
 
 WORKDIR /workspace
 
