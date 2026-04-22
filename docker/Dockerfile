@@ -56,7 +56,9 @@ RUN apt update && apt install -y --no-install-recommends \
     zstd \
     linux-modules-extra-$(uname -r) \
     bc \
-    linux-firmware
+    linux-firmware \
+    clang-format \
+    openssh-client
 
 WORKDIR /workspace
 
