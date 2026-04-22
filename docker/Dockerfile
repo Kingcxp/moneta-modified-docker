@@ -58,7 +58,8 @@ RUN apt update && apt install -y --no-install-recommends \
     bc \
     linux-firmware \
     clang-format \
-    openssh-client
+    openssh-client \
+    tmux
 
 WORKDIR /workspace
 
