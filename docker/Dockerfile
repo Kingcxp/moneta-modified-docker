@@ -59,7 +59,8 @@ RUN apt update && apt install -y --no-install-recommends \
     linux-firmware \
     clang-format \
     openssh-client \
-    tmux
+    tmux \
+    gcc-10
 
 WORKDIR /workspace
 
