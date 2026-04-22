@@ -66,6 +66,7 @@ COPY --chown=root:root moneta-modified/ /workspace/moneta
 COPY --chown=root:root scripts/entrypoint.sh /workspace/entrypoint.sh
 
 RUN chmod +x /workspace/moneta/scripts/*.sh
+RUN chmod +x /workspace/moneta/scripts/qemu-automation.exp
 RUN chmod +x /workspace/moneta/build.sh
 RUN chmod +x /workspace/entrypoint.sh
 
