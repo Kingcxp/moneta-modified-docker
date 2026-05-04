@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 
 RUN apt update && apt install -y --no-install-recommends \
+    bash \
     sudo \
     micro \
     tree \
