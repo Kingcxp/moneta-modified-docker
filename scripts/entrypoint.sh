@@ -4,3 +4,5 @@ set -euo pipefail
 cd /workspace/moneta
 
 bash ./build.sh
+
+sudo poweroff
