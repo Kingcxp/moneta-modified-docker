@@ -239,6 +239,8 @@ fi
 echo "[host] Starting container with privileged access and device passthrough"
 echo "  (container will mount this repo at /workspace)"
 
+sudo modprobe nbd max_part=8
+
 # Run container in foreground; when it exits cleanup trap will run
 run_as_root "docker run --rm --privileged --name moneta-nvidia \
   ${DOCKER_DEV_ARGS} --env-file $REPO_ROOT/.env -e PCI_FULL=${PCI_FULL} \
